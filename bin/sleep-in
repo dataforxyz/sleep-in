@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+input=$(omarchy-menu-input "Sleep in (e.g. 90, 2h, 30m, 1h30)" --width 360) || exit 0
+input=$(echo "$input" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+[[ -z "$input" ]] && exit 0
+
+mins=0
+if [[ "$input" =~ ^([0-9]+)h([0-9]+)m?$ ]]; then
+  mins=$((BASH_REMATCH[1] * 60 + BASH_REMATCH[2]))
+elif [[ "$input" =~ ^([0-9]+)h$ ]]; then
+  mins=$((BASH_REMATCH[1] * 60))
+elif [[ "$input" =~ ^([0-9]+)m?$ ]]; then
+  mins=${BASH_REMATCH[1]}
+else
+  notify-send "Sleep timer" "Couldn't parse: $input" -u critical
+  exit 1
+fi
+
+if ((mins < 1)); then
+  notify-send "Sleep timer" "Duration must be at least 1 minute" -u critical
+  exit 1
+fi
+
+unit="sleep-in-$(date +%s)"
+systemd-run --user --unit="$unit" --on-active="${mins}m" systemctl suspend >/dev/null
+pkill -RTMIN+11 waybar 2>/dev/null || true
+
+when=$(date -d "+${mins} minutes" "+%H:%M")
+notify-send "󰒲 Suspend scheduled" "In ${mins} min (at ${when})\nClick the sleep timer in the top bar to cancel"
