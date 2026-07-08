@@ -2,13 +2,12 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-bin_src="$repo_dir/bin/sleep-in"
-bin_dst="$HOME/.local/bin/sleep-in"
 binding='bindd = SUPER CTRL ALT, S, Schedule suspend, exec, ~/.local/bin/sleep-in'
 hypr_bindings="$HOME/.config/hypr/bindings.conf"
 
-install -Dm755 "$bin_src" "$bin_dst"
-echo "Installed $bin_dst"
+install -Dm755 "$repo_dir/bin/sleep-in" "$HOME/.local/bin/sleep-in"
+install -Dm755 "$repo_dir/bin/sleep-in-fire" "$HOME/.local/bin/sleep-in-fire"
+echo "Installed Sleep In helpers to $HOME/.local/bin"
 
 if [[ -f "$hypr_bindings" ]]; then
   if grep -Fqx "$binding" "$hypr_bindings"; then

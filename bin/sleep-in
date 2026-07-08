@@ -22,8 +22,32 @@ if ((mins < 1)); then
   exit 1
 fi
 
+fire="$HOME/.local/bin/sleep-in-fire"
+if [[ ! -x "$fire" ]]; then
+  notify-send "Sleep timer" "Missing executable: $fire" -u critical
+  exit 1
+fi
+
 unit="sleep-in-$(date +%s)"
-systemd-run --user --unit="$unit" --on-active="${mins}m" systemctl suspend >/dev/null
+run_args=(
+  systemd-run
+  --user
+  --collect
+  --unit="$unit"
+  --description="Sleep In: suspend after ${mins}m"
+  --on-active="${mins}m"
+)
+
+# Preserve the current Hyprland session coordinates for the future timer fire.
+# This lets sleep-in-fire ask Hyprland to spawn the suspend request from the
+# active desktop session, which avoids invisible auth prompts from user services.
+for name in HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY; do
+  if [[ -n "${!name:-}" ]]; then
+    run_args+=(--setenv="$name=${!name}")
+  fi
+done
+
+"${run_args[@]}" "$fire" >/dev/null
 pkill -RTMIN+11 waybar 2>/dev/null || true
 
 when=$(date -d "+${mins} minutes" "+%H:%M")

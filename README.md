@@ -8,14 +8,16 @@ Press `Super` + `Ctrl` + `Alt` + `S`, enter a duration like `90`, `30m`, `2h`, o
 
 - Prompts for a delay with `omarchy-menu-input`.
 - Parses minutes, hours, or hour+minute inputs.
-- Schedules `systemctl suspend` using `systemd-run --user --on-active=...`.
+- Schedules a user timer using `systemd-run --user --on-active=...`.
+- When the timer fires, asks Hyprland to spawn `systemctl --no-ask-password suspend` from the active desktop session.
 - Sends a desktop notification with the scheduled suspend time.
 - Pings Waybar with `RTMIN+11` so a sleep-timer module can refresh, if you have one.
 
 ## Files
 
 ```text
-bin/sleep-in          # executable helper
+bin/sleep-in          # prompt + timer scheduler
+bin/sleep-in-fire     # timer target that requests suspend through Hyprland
 hypr/sleep-in.conf    # Hyprland binding snippet
 install.sh            # installer for ~/.local/bin and ~/.config/hypr/bindings.conf
 ```
@@ -28,10 +30,11 @@ cd sleep-in
 ./install.sh
 ```
 
-The installer copies the script to:
+The installer copies the helpers to:
 
 ```text
 ~/.local/bin/sleep-in
+~/.local/bin/sleep-in-fire
 ```
 
 It also adds this binding to `~/.config/hypr/bindings.conf` when that shortcut is not already bound:
@@ -46,6 +49,7 @@ Hyprland usually reloads automatically when config files change; the installer a
 
 ```bash
 install -Dm755 bin/sleep-in ~/.local/bin/sleep-in
+install -Dm755 bin/sleep-in-fire ~/.local/bin/sleep-in-fire
 ```
 
 Then add this to your Hyprland bindings:
@@ -61,6 +65,10 @@ bindd = SUPER CTRL ALT, S, Schedule suspend, exec, ~/.local/bin/sleep-in
 - `systemd-run --user`
 - `notify-send`
 - Waybar is optional; the script ignores it if it is not running
+
+## Why the timer fires through Hyprland
+
+Calling `systemctl suspend` directly from a `systemd --user` timer can run outside the active desktop session. On some systems that leaves `systemctl` waiting for an invisible interactive authorization prompt, so the timer appears in Waybar but never reaches logind. `sleep-in-fire` avoids that by asking Hyprland to start the suspend command inside the active session when the timer fires.
 
 ## Cancel a scheduled suspend
 
