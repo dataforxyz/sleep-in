@@ -1,54 +1,230 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-input=$(omarchy-menu-input "Sleep in (e.g. 90, 2h, 30m, 1h30)" --width 360) || exit 0
-input=$(echo "$input" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-[[ -z "$input" ]] && exit 0
+readonly APP_NAME="Sleep In"
+readonly UNIT_NAME="sleep-in"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sleep-in"
+readonly STATE_FILE="$STATE_DIR/timer"
+readonly IDLE_TOGGLE="${SLEEP_IN_IDLE_TOGGLE:-omarchy-toggle-idle}"
+readonly SUSPEND_CMD="${SLEEP_IN_SUSPEND_CMD:-/usr/bin/systemctl --no-ask-password suspend}"
 
-mins=0
-if [[ "$input" =~ ^([0-9]+)h([0-9]+)m?$ ]]; then
-  mins=$((BASH_REMATCH[1] * 60 + BASH_REMATCH[2]))
-elif [[ "$input" =~ ^([0-9]+)h$ ]]; then
-  mins=$((BASH_REMATCH[1] * 60))
-elif [[ "$input" =~ ^([0-9]+)m?$ ]]; then
-  mins=${BASH_REMATCH[1]}
-else
-  notify-send "Sleep timer" "Couldn't parse: $input" -u critical
-  exit 1
-fi
+notify() {
+  local title=$1
+  local message=$2
+  local urgency=${3:-normal}
+  command -v notify-send >/dev/null 2>&1 && notify-send "$title" "$message" -u "$urgency"
+}
 
-if ((mins < 1)); then
-  notify-send "Sleep timer" "Duration must be at least 1 minute" -u critical
-  exit 1
-fi
+refresh_waybar() {
+  pkill -RTMIN+11 waybar 2>/dev/null || true
+}
 
-fire="$HOME/.local/bin/sleep-in-fire"
-if [[ ! -x "$fire" ]]; then
-  notify-send "Sleep timer" "Missing executable: $fire" -u critical
-  exit 1
-fi
-
-unit="sleep-in-$(date +%s)"
-run_args=(
-  systemd-run
-  --user
-  --collect
-  --unit="$unit"
-  --description="Sleep In: suspend after ${mins}m"
-  --on-active="${mins}m"
-)
-
-# Preserve the current Hyprland session coordinates for the future timer fire.
-# This lets sleep-in-fire ask Hyprland to spawn the suspend request from the
-# active desktop session, which avoids invisible auth prompts from user services.
-for name in HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY; do
-  if [[ -n "${!name:-}" ]]; then
-    run_args+=(--setenv="$name=${!name}")
+log() {
+  local priority=$1
+  shift
+  if command -v systemd-cat >/dev/null 2>&1; then
+    printf '%s\n' "$*" | systemd-cat -t sleep-in -p "$priority"
+  else
+    printf 'sleep-in: %s\n' "$*" >&2
   fi
-done
+}
 
-"${run_args[@]}" "$fire" >/dev/null
-pkill -RTMIN+11 waybar 2>/dev/null || true
+parse_duration() {
+  local input=${1//[[:space:]]/}
+  input=${input,,}
 
-when=$(date -d "+${mins} minutes" "+%H:%M")
-notify-send "󰒲 Suspend scheduled" "In ${mins} min (at ${when})\nClick the sleep timer in the top bar to cancel"
+  if [[ "$input" =~ ^([0-9]+)h([0-9]+)m?$ ]]; then
+    printf '%s\n' "$((BASH_REMATCH[1] * 60 + BASH_REMATCH[2]))"
+  elif [[ "$input" =~ ^([0-9]+)h$ ]]; then
+    printf '%s\n' "$((BASH_REMATCH[1] * 60))"
+  elif [[ "$input" =~ ^([0-9]+)m?$ ]]; then
+    printf '%s\n' "$((10#${BASH_REMATCH[1]}))"
+  else
+    return 1
+  fi
+}
+
+state_value() {
+  local key=$1
+  [[ -f "$STATE_FILE" ]] || return 1
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$STATE_FILE"
+}
+
+idle_is_active() {
+  pgrep -x hypridle >/dev/null 2>&1
+}
+
+toggle_idle() {
+  if command -v "$IDLE_TOGGLE" >/dev/null 2>&1; then
+    "$IDLE_TOGGLE"
+  elif idle_is_active; then
+    pkill -x hypridle
+  else
+    uwsm-app -- hypridle >/dev/null 2>&1 &
+  fi
+}
+
+disable_idle() {
+  if idle_is_active; then
+    toggle_idle
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+restore_idle() {
+  local restore_idle=${1:-$(state_value restore_idle 2>/dev/null || printf '0')}
+  if [[ "$restore_idle" == "1" ]] && ! idle_is_active; then
+    toggle_idle
+  fi
+}
+
+stop_units() {
+  systemctl --user stop "$UNIT_NAME.timer" "$UNIT_NAME.service" >/dev/null 2>&1 || true
+
+  # Clean up timers created by versions that used sleep-in-<timestamp> names.
+  local legacy_units
+  legacy_units=$(systemctl --user list-units --all --plain --no-legend 'sleep-in-*.timer' 2>/dev/null | awk '{print $1}')
+  if [[ -n "$legacy_units" ]]; then
+    # Unit names come from systemd, not user input; word splitting is intentional.
+    # shellcheck disable=SC2086
+    systemctl --user stop $legacy_units >/dev/null 2>&1 || true
+  fi
+}
+
+cancel_timer() {
+  local quiet=${1:-false}
+  local restore
+  restore=$(state_value restore_idle 2>/dev/null || printf '0')
+
+  stop_units
+  restore_idle "$restore"
+  rm -f "$STATE_FILE"
+  refresh_waybar
+
+  if [[ "$quiet" != "true" ]]; then
+    notify "󰒲 Suspend cancelled" "The scheduled suspend was removed"
+  fi
+}
+
+schedule_timer() {
+  local raw_duration=$1
+  local mins
+  if ! mins=$(parse_duration "$raw_duration"); then
+    notify "Sleep timer" "Couldn't parse: $raw_duration" critical
+    return 1
+  fi
+  if ((mins < 1)); then
+    notify "Sleep timer" "Duration must be at least 1 minute" critical
+    return 1
+  fi
+
+  cancel_timer true
+
+  local restore deadline tmp_state scheduled=false
+  restore=$(disable_idle)
+  deadline=$(date -d "+${mins} minutes" +%s)
+  mkdir -p "$STATE_DIR"
+  tmp_state=$(mktemp "$STATE_DIR/.timer.XXXXXX")
+  printf 'deadline=%s\nminutes=%s\nrestore_idle=%s\n' "$deadline" "$mins" "$restore" >"$tmp_state"
+  mv "$tmp_state" "$STATE_FILE"
+
+  cleanup_failed_schedule() {
+    if [[ "$scheduled" != "true" ]]; then
+      stop_units
+      restore_idle "$restore"
+      rm -f "$STATE_FILE"
+    fi
+  }
+  trap cleanup_failed_schedule RETURN
+
+  local run_args=(
+    systemd-run
+    --user
+    --collect
+    --unit="$UNIT_NAME"
+    --description="$APP_NAME: suspend after ${mins}m"
+    --on-calendar="@${deadline}"
+    --timer-property=AccuracySec=1s
+  )
+
+  # Give the future service access to the current graphical session so it can
+  # ask Hyprland to launch the suspend request without a hidden auth prompt.
+  local name
+  for name in HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY XDG_STATE_HOME; do
+    if [[ -n "${!name:-}" ]]; then
+      run_args+=(--setenv="$name=${!name}")
+    fi
+  done
+
+  "${run_args[@]}" "$HOME/.local/bin/sleep-in" fire >/dev/null
+  scheduled=true
+  trap - RETURN
+
+  refresh_waybar
+  local when
+  when=$(date -d "@${deadline}" '+%H:%M')
+  notify "󰒲 Suspend scheduled" "In ${mins} min (at ${when})\nNormal idle sleep is disabled until this timer fires or is cancelled"
+}
+
+fire_timer() {
+  local restore
+  restore=$(state_value restore_idle 2>/dev/null || printf '0')
+  rm -f "$STATE_FILE"
+  restore_idle "$restore"
+  refresh_waybar
+
+  log info "sleep timer fired; requesting suspend via Hyprland session"
+  if command -v hyprctl >/dev/null 2>&1; then
+    if hyprctl dispatch exec "$SUSPEND_CMD"; then
+      log info "suspend request dispatched through Hyprland"
+      return 0
+    fi
+    log warning "Hyprland dispatch failed; falling back to direct suspend request"
+  fi
+
+  bash -lc "$SUSPEND_CMD"
+}
+
+show_status() {
+  local deadline mins
+  deadline=$(state_value deadline 2>/dev/null || true)
+  mins=$(state_value minutes 2>/dev/null || true)
+  if [[ -n "$deadline" ]] && systemctl --user is-active --quiet "$UNIT_NAME.timer"; then
+    printf 'scheduled\t%s\t%s\n' "$deadline" "$mins"
+  else
+    printf 'inactive\n'
+  fi
+}
+
+prompt_and_schedule() {
+  local input
+  input=$(omarchy-menu-input "Sleep in (e.g. 90, 2h, 30m, 1h30)" --width 360) || return 0
+  [[ -n "${input//[[:space:]]/}" ]] || return 0
+  schedule_timer "$input"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sleep-in                 Prompt for a suspend delay
+  sleep-in schedule DELAY  Schedule suspend (examples: 90, 30m, 2h, 1h30)
+  sleep-in cancel          Cancel suspend and restore normal idle behavior
+  sleep-in status          Print timer status
+EOF
+}
+
+main() {
+  case ${1:-prompt} in
+    prompt) prompt_and_schedule ;;
+    schedule) [[ $# -eq 2 ]] || { usage >&2; return 2; }; schedule_timer "$2" ;;
+    cancel) cancel_timer ;;
+    status) show_status ;;
+    fire) fire_timer ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"

@@ -1,26 +1,21 @@
 # Sleep In
 
-Small Omarchy/Hyprland helper for scheduling system suspend from a keyboard shortcut.
+Small Omarchy/Hyprland helper for suspending the system after a chosen wall-clock delay.
 
-Press `Super` + `Ctrl` + `Alt` + `S`, enter a duration like `90`, `30m`, `2h`, or `1h30`, and the machine will suspend after that delay.
+Press `Super` + `Ctrl` + `Alt` + `S`, then enter a duration such as `90`, `30m`, `2h`, or `1h30`.
 
-## What it does
+## Behavior
 
-- Prompts for a delay with `omarchy-menu-input`.
-- Parses minutes, hours, or hour+minute inputs.
-- Schedules a user timer using `systemd-run --user --on-active=...`.
-- When the timer fires, asks Hyprland to spawn `systemctl --no-ask-password suspend` from the active desktop session.
-- Sends a desktop notification with the scheduled suspend time.
-- Pings Waybar with `RTMIN+11` so a sleep-timer module can refresh, if you have one.
+When a timer is scheduled, Sleep In:
 
-## Files
+1. Disables `hypridle` through `omarchy-toggle-idle`—the same action as `Super` + `Ctrl` + `I`—so the normal idle suspend cannot happen first.
+2. Creates one transient systemd user timer for the requested wall-clock deadline.
+3. Restores normal idle behavior when the timer fires or is cancelled.
+4. Asks Hyprland to launch `systemctl --no-ask-password suspend` from the graphical session, avoiding hidden authorization prompts from a background user service.
 
-```text
-bin/sleep-in          # prompt + timer scheduler
-bin/sleep-in-fire     # timer target that requests suspend through Hyprland
-hypr/sleep-in.conf    # Hyprland binding snippet
-install.sh            # installer for ~/.local/bin and ~/.config/hypr/bindings.conf
-```
+Only one timer is active at a time. Scheduling another replaces the existing timer.
+
+The timer uses a realtime `OnCalendar` deadline rather than a monotonic `OnActive` delay. Monotonic timers pause while the computer is suspended, which can leave an old timer pending after the computer resumes.
 
 ## Install
 
@@ -37,13 +32,43 @@ The installer copies the helpers to:
 ~/.local/bin/sleep-in-fire
 ```
 
-It also adds this binding to `~/.config/hypr/bindings.conf` when that shortcut is not already bound:
+It also adds this binding to `~/.config/hypr/bindings.conf` if the shortcut is available:
 
 ```conf
 bindd = SUPER CTRL ALT, S, Schedule suspend, exec, ~/.local/bin/sleep-in
 ```
 
-Hyprland usually reloads automatically when config files change; the installer also attempts `hyprctl reload` when running inside Hyprland.
+Hyprland usually reloads automatically after config changes; the installer also attempts a reload and reports config errors when run inside Hyprland.
+
+## Commands
+
+```bash
+sleep-in                  # Prompt for a delay
+sleep-in schedule 1h30    # Schedule without the prompt
+sleep-in status           # Print the current timer state
+sleep-in cancel           # Cancel and restore normal idle behavior
+```
+
+`status` prints either `inactive` or a tab-separated line containing `scheduled`, the deadline epoch, and the requested minutes.
+
+## Files
+
+```text
+bin/sleep-in          # timer lifecycle, idle handling, status, and suspend request
+bin/sleep-in-fire     # compatibility wrapper for timers from older versions
+hypr/sleep-in.conf    # Hyprland binding snippet
+install.sh            # installer
+```
+
+Runtime state is stored under `${XDG_STATE_HOME:-~/.local/state}/sleep-in/`.
+
+## Requirements
+
+- Hyprland
+- Omarchy's `omarchy-menu-input` and `omarchy-toggle-idle`
+- `systemd-run --user`
+- `notify-send`
+- Waybar is optional; Sleep In sends its refresh signal when available
 
 ## Manual install
 
@@ -52,31 +77,10 @@ install -Dm755 bin/sleep-in ~/.local/bin/sleep-in
 install -Dm755 bin/sleep-in-fire ~/.local/bin/sleep-in-fire
 ```
 
-Then add this to your Hyprland bindings:
+Then add this to `~/.config/hypr/bindings.conf`:
 
 ```conf
 bindd = SUPER CTRL ALT, S, Schedule suspend, exec, ~/.local/bin/sleep-in
-```
-
-## Requirements
-
-- Hyprland
-- Omarchy's `omarchy-menu-input`
-- `systemd-run --user`
-- `notify-send`
-- Waybar is optional; the script ignores it if it is not running
-
-## Why the timer fires through Hyprland
-
-Calling `systemctl suspend` directly from a `systemd --user` timer can run outside the active desktop session. On some systems that leaves `systemctl` waiting for an invisible interactive authorization prompt, so the timer appears in Waybar but never reaches logind. `sleep-in-fire` avoids that by asking Hyprland to start the suspend command inside the active session when the timer fires.
-
-## Cancel a scheduled suspend
-
-The script creates transient user units named `sleep-in-<timestamp>`. You can list or cancel them with systemd:
-
-```bash
-systemctl --user list-timers 'sleep-in-*'
-systemctl --user stop 'sleep-in-*.timer' 'sleep-in-*.service'
 ```
 
 ## License

@@ -1,32 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-log() {
-  local priority=$1
-  shift
-  if command -v systemd-cat >/dev/null 2>&1; then
-    printf '%s\n' "$*" | systemd-cat -t sleep-in -p "$priority"
-  else
-    printf 'sleep-in: %s\n' "$*" >&2
-  fi
-}
-
-suspend_cmd=${SLEEP_IN_SUSPEND_CMD:-/usr/bin/systemctl --no-ask-password suspend}
-
-log info "sleep timer fired; requesting suspend via Hyprland session"
-
-# The timer itself runs from the systemd user manager. On this system, calling
-# `systemctl suspend` directly from that context can hang waiting for interactive
-# authorization and never reach logind. Ask Hyprland to spawn the suspend request
-# inside the active desktop session instead.
-if command -v hyprctl >/dev/null 2>&1; then
-  if hyprctl dispatch exec "$suspend_cmd"; then
-    log info "suspend request dispatched through Hyprland"
-    exit 0
-  fi
-  log warning "Hyprland dispatch failed; falling back to direct suspend request"
-fi
-
-# Fallback for non-Hyprland launches. --no-ask-password prevents a background
-# timer from hanging forever on an invisible auth prompt.
-bash -lc "$suspend_cmd"
+# Compatibility entry point for timers created by older Sleep In versions.
+exec "$HOME/.local/bin/sleep-in" fire
