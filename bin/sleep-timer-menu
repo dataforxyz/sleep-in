@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Confirm cancellation of the current Sleep In timer from Waybar."""
+
+import datetime as dt
+import subprocess
+import sys
+import time
+
+WAYBAR_SIGNAL = "RTMIN+11"
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, stderr=subprocess.DEVNULL, text=True, **kwargs)
+
+
+def sleep_in_status():
+    proc = run(["sleep-in", "status"], stdout=subprocess.PIPE)
+    fields = proc.stdout.strip().split("\t") if proc.returncode == 0 else []
+    if len(fields) != 3 or fields[0] != "scheduled":
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def duration(seconds):
+    if seconds < 60:
+        return "<1m"
+    minutes = (seconds + 59) // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h" if minutes == 0 else f"{hours}h{minutes:02d}"
+
+
+def notify(title, body=""):
+    run(["notify-send", "-u", "low", title, body])
+
+
+def refresh_waybar():
+    run(["pkill", f"-{WAYBAR_SIGNAL}", "waybar"])
+
+
+def main():
+    deadline = sleep_in_status()
+    if deadline is None:
+        notify("Sleep timer", "No suspend timer is running")
+        refresh_waybar()
+        return 0
+
+    remaining = max(0, deadline - int(time.time()))
+    when = dt.datetime.fromtimestamp(deadline).strftime("%H:%M")
+    choice = f"Cancel suspend in {duration(remaining)} (at {when})"
+    proc = run(
+        [
+            "omarchy-launch-walker",
+            "--dmenu",
+            "--width",
+            "480",
+            "--minheight",
+            "1",
+            "--maxheight",
+            "180",
+            "-p",
+            "Sleep timer…",
+        ],
+        input=choice + "\n",
+        stdout=subprocess.PIPE,
+    )
+    if proc.returncode != 0 or proc.stdout.strip() != choice:
+        return 0
+
+    # Use Sleep In's cancellation path so the saved hypridle state is restored.
+    return run(["sleep-in", "cancel"]).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

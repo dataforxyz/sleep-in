@@ -30,6 +30,8 @@ The installer copies the helpers to:
 ```text
 ~/.local/bin/sleep-in
 ~/.local/bin/sleep-in-fire
+~/.local/bin/sleep-timer-status
+~/.local/bin/sleep-timer-menu
 ```
 
 It also adds this binding to `~/.config/hypr/bindings.conf` if the shortcut is available:
@@ -54,10 +56,12 @@ sleep-in cancel           # Cancel and restore normal idle behavior
 ## Files
 
 ```text
-bin/sleep-in          # timer lifecycle, idle handling, status, and suspend request
-bin/sleep-in-fire     # compatibility wrapper for timers from older versions
-hypr/sleep-in.conf    # Hyprland binding snippet
-install.sh            # installer
+bin/sleep-in           # timer lifecycle, idle handling, status, and suspend request
+bin/sleep-in-fire      # compatibility wrapper for timers from older versions
+bin/sleep-timer-status # Waybar JSON status provider
+bin/sleep-timer-menu   # Waybar cancellation menu
+hypr/sleep-in.conf     # Hyprland binding snippet
+install.sh             # installer
 ```
 
 Runtime state is stored under `${XDG_STATE_HOME:-~/.local/state}/sleep-in/`.
@@ -68,13 +72,15 @@ Runtime state is stored under `${XDG_STATE_HOME:-~/.local/state}/sleep-in/`.
 - Omarchy's `omarchy-menu-input` and `omarchy-toggle-idle`
 - `systemd-run --user`
 - `notify-send`
-- Waybar is optional; Sleep In sends its refresh signal when available
+- Waybar is optional; Sleep In includes status/menu helpers and sends their refresh signal when available
 
 ## Manual install
 
 ```bash
 install -Dm755 bin/sleep-in ~/.local/bin/sleep-in
 install -Dm755 bin/sleep-in-fire ~/.local/bin/sleep-in-fire
+install -Dm755 bin/sleep-timer-status ~/.local/bin/sleep-timer-status
+install -Dm755 bin/sleep-timer-menu ~/.local/bin/sleep-timer-menu
 ```
 
 Then add this to `~/.config/hypr/bindings.conf`:

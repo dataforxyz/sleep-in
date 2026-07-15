@@ -7,6 +7,8 @@ hypr_bindings="$HOME/.config/hypr/bindings.conf"
 
 install -Dm755 "$repo_dir/bin/sleep-in" "$HOME/.local/bin/sleep-in"
 install -Dm755 "$repo_dir/bin/sleep-in-fire" "$HOME/.local/bin/sleep-in-fire"
+install -Dm755 "$repo_dir/bin/sleep-timer-status" "$HOME/.local/bin/sleep-timer-status"
+install -Dm755 "$repo_dir/bin/sleep-timer-menu" "$HOME/.local/bin/sleep-timer-menu"
 echo "Installed Sleep In helpers to $HOME/.local/bin"
 
 if [[ -f "$hypr_bindings" ]]; then
