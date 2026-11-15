@@ -9,12 +9,16 @@ import time
 
 
 def sleep_in_status():
-    proc = subprocess.run(
-        ["sleep-in", "status"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["sleep-in", "status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if proc.returncode != 0:
         return None
 

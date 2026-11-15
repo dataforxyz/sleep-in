@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 readonly APP_NAME="Sleep In"
 readonly UNIT_NAME="sleep-in"
@@ -7,12 +8,18 @@ readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sleep-in"
 readonly STATE_FILE="$STATE_DIR/timer"
 readonly IDLE_TOGGLE="${SLEEP_IN_IDLE_TOGGLE:-omarchy-toggle-idle}"
 readonly SUSPEND_CMD="${SLEEP_IN_SUSPEND_CMD:-/usr/bin/systemctl --no-ask-password suspend}"
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+readonly SELF
+readonly MAX_MINUTES=525600
 
 notify() {
   local title=$1
   local message=$2
   local urgency=${3:-normal}
-  command -v notify-send >/dev/null 2>&1 && notify-send "$title" "$message" -u "$urgency"
+  if command -v notify-send >/dev/null 2>&1; then
+    # AppImage launchers can leak their bundled libraries into CLI children.
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD notify-send "$title" "$message" -u "$urgency" || true
+  fi
 }
 
 refresh_waybar() {
@@ -23,7 +30,7 @@ log() {
   local priority=$1
   shift
   if command -v systemd-cat >/dev/null 2>&1; then
-    printf '%s\n' "$*" | systemd-cat -t sleep-in -p "$priority"
+    printf '%s\n' "$*" | systemd-cat -t sleep-in -p "$priority" || true
   else
     printf 'sleep-in: %s\n' "$*" >&2
   fi
@@ -33,15 +40,19 @@ parse_duration() {
   local input=${1//[[:space:]]/}
   input=${input,,}
 
-  if [[ "$input" =~ ^([0-9]+)h([0-9]+)m?$ ]]; then
-    printf '%s\n' "$((BASH_REMATCH[1] * 60 + BASH_REMATCH[2]))"
-  elif [[ "$input" =~ ^([0-9]+)h$ ]]; then
-    printf '%s\n' "$((BASH_REMATCH[1] * 60))"
-  elif [[ "$input" =~ ^([0-9]+)m?$ ]]; then
-    printf '%s\n' "$((10#${BASH_REMATCH[1]}))"
+  local hours=0 minutes=0
+  if [[ "$input" =~ ^([0-9]{1,6})h([0-9]{1,6})m?$ ]]; then
+    hours=$((10#${BASH_REMATCH[1]})) minutes=$((10#${BASH_REMATCH[2]}))
+  elif [[ "$input" =~ ^([0-9]{1,6})h$ ]]; then
+    hours=$((10#${BASH_REMATCH[1]}))
+  elif [[ "$input" =~ ^([0-9]{1,6})m?$ ]]; then
+    minutes=$((10#${BASH_REMATCH[1]}))
   else
     return 1
   fi
+  minutes=$((hours * 60 + minutes))
+  ((minutes >= 1 && minutes <= MAX_MINUTES)) || return 1
+  printf '%s\n' "$minutes"
 }
 
 state_value() {
@@ -51,23 +62,36 @@ state_value() {
 }
 
 idle_is_active() {
-  pgrep -x hypridle >/dev/null 2>&1
+  if [[ -f /usr/share/omarchy/shell/plugins/services/idle/Service.qml ]]; then
+    # Quattro's helper reports whether Stay Awake is enabled, so invert it
+    # when asking whether normal idle behavior is active.
+    "$IDLE_TOGGLE" status 2>/dev/null | jq -e '.enabled == false' >/dev/null
+  else
+    pgrep -x hypridle >/dev/null 2>&1
+  fi
 }
 
 toggle_idle() {
   if command -v "$IDLE_TOGGLE" >/dev/null 2>&1; then
-    "$IDLE_TOGGLE"
+    # Omarchy's helper may exit nonzero when Waybar is not running.
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD "$IDLE_TOGGLE" >&2 9>&- || true
   elif idle_is_active; then
-    pkill -x hypridle
+    pkill -x hypridle || true
   else
-    uwsm-app -- hypridle >/dev/null 2>&1 &
+    uwsm-app -- hypridle >/dev/null 2>&1 9>&- &
   fi
 }
 
 disable_idle() {
   if idle_is_active; then
     toggle_idle
-    printf '1\n'
+    local i
+    for i in {1..20}; do
+      idle_is_active || { printf '1\n'; return 0; }
+      sleep 0.1
+    done
+    log err "could not disable idle behavior"
+    return 1
   else
     printf '0\n'
   fi
@@ -77,11 +101,20 @@ restore_idle() {
   local restore_idle=${1:-$(state_value restore_idle 2>/dev/null || printf '0')}
   if [[ "$restore_idle" == "1" ]] && ! idle_is_active; then
     toggle_idle
+    local i
+    for i in {1..30}; do
+      idle_is_active && return 0
+      sleep 0.1
+    done
+    log warning "could not restore normal idle behavior; enable it manually"
+    notify "Sleep In: idle restore failed" "Enable normal idle behavior with Super+Ctrl+I" critical
   fi
 }
 
 stop_units() {
-  systemctl --user stop "$UNIT_NAME.timer" "$UNIT_NAME.service" >/dev/null 2>&1 || true
+  systemctl --user stop "$UNIT_NAME.timer" >/dev/null 2>&1 || true
+  # A service may be waiting for the lifecycle lock; never wait for its stop.
+  systemctl --user stop --no-block "$UNIT_NAME.service" >/dev/null 2>&1 || true
 
   # Clean up timers created by versions that used sleep-in-<timestamp> names.
   local legacy_units
@@ -101,6 +134,7 @@ cancel_timer() {
   stop_units
   restore_idle "$restore"
   rm -f "$STATE_FILE"
+  rm -f "$STATE_DIR"/request.*
   refresh_waybar
 
   if [[ "$quiet" != "true" ]]; then
@@ -112,32 +146,26 @@ schedule_timer() {
   local raw_duration=$1
   local mins
   if ! mins=$(parse_duration "$raw_duration"); then
-    notify "Sleep timer" "Couldn't parse: $raw_duration" critical
+    notify "Sleep timer" "Use a duration from 1 minute to 1 year (e.g. 90, 2h, 1h30)" critical
     return 1
   fi
-  if ((mins < 1)); then
-    notify "Sleep timer" "Duration must be at least 1 minute" critical
-    return 1
+  local restore deadline tmp_state token
+  # Preserve the original idle state across replacements without toggling twice.
+  restore=$(state_value restore_idle 2>/dev/null || printf '0')
+  stop_units
+  rm -f "$STATE_DIR"/request.*
+  if idle_is_active; then
+    restore=$(disable_idle) || { restore_idle 1; return 1; }
   fi
-
-  cancel_timer true
-
-  local restore deadline tmp_state scheduled=false
-  restore=$(disable_idle)
+  # EXIT (not RETURN) also runs when errexit aborts a failed systemd-run.
+  # Keep the restore flag outside the function scope for EXIT after unwinding.
+  SCHEDULE_RESTORE=$restore
+  trap 'stop_units; restore_idle "$SCHEDULE_RESTORE"; rm -f "$STATE_FILE"; refresh_waybar' EXIT
   deadline=$(date -d "+${mins} minutes" +%s)
-  mkdir -p "$STATE_DIR"
+  token="$(date +%s%N)-$$"
   tmp_state=$(mktemp "$STATE_DIR/.timer.XXXXXX")
-  printf 'deadline=%s\nminutes=%s\nrestore_idle=%s\n' "$deadline" "$mins" "$restore" >"$tmp_state"
+  printf 'deadline=%s\nminutes=%s\nrestore_idle=%s\ntoken=%s\n' "$deadline" "$mins" "$restore" "$token" >"$tmp_state"
   mv "$tmp_state" "$STATE_FILE"
-
-  cleanup_failed_schedule() {
-    if [[ "$scheduled" != "true" ]]; then
-      stop_units
-      restore_idle "$restore"
-      rm -f "$STATE_FILE"
-    fi
-  }
-  trap cleanup_failed_schedule RETURN
 
   local run_args=(
     systemd-run
@@ -147,20 +175,22 @@ schedule_timer() {
     --description="$APP_NAME: suspend after ${mins}m"
     --on-calendar="@${deadline}"
     --timer-property=AccuracySec=1s
+    --property=TimeoutStartSec=infinity
   )
 
   # Give the future service access to the current graphical session so it can
   # ask Hyprland to launch the suspend request without a hidden auth prompt.
   local name
-  for name in HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY XDG_STATE_HOME; do
+  for name in HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY XDG_STATE_HOME SLEEP_IN_IDLE_TOGGLE SLEEP_IN_SUSPEND_CMD; do
     if [[ -n "${!name:-}" ]]; then
       run_args+=(--setenv="$name=${!name}")
     fi
   done
 
-  "${run_args[@]}" "$HOME/.local/bin/sleep-in" fire >/dev/null
-  scheduled=true
-  trap - RETURN
+  "${run_args[@]}" "$SELF" fire "$token" >/dev/null
+  trap - EXIT
+  unset SCHEDULE_RESTORE
+  log info "scheduled ${mins}m timer for epoch $deadline ($token)"
 
   refresh_waybar
   local when
@@ -168,23 +198,177 @@ schedule_timer() {
   notify "󰒲 Suspend scheduled" "In ${mins} min (at ${when})\nNormal idle sleep is disabled until this timer fires or is cancelled"
 }
 
+current_token() {
+  [[ -n "$1" && "$(state_value token 2>/dev/null)" == "$1" ]]
+}
+
+request_suspend() {
+  local token=$1 result=$2 rc=0
+  acquire_lock
+  current_token "$token" || return 0
+  flock -u 9
+  : >"$result.log"
+  systemd-inhibit --list --no-pager >"$result.inhibitors" 2>&1 || true
+
+  # An interrupted updater can leave its sleep inhibitor behind. The stock
+  # cleanup verifies the recorded process identity before releasing it. Only
+  # clean it while holding the updater's own lock; a real update must retain
+  # its protection, and all other application inhibitors remain respected.
+  if command -v omarchy-update-lock >/dev/null 2>&1 &&
+     command -v omarchy-update-stay-awake >/dev/null 2>&1 &&
+     ! omarchy-update-lock run omarchy-update-stay-awake stop >>"$result.log" 2>&1; then
+    printf '%s\n' 'Suspend deferred: an update is running or its sleep protection could not be safely released.' >>"$result.log"
+    rc=1
+  else
+    bash -c "$SUSPEND_CMD" >>"$result.log" 2>&1 || rc=$?
+  fi
+  printf '%s\n' "$rc" >"$result.tmp"
+  mv "$result.tmp" "$result"
+}
+
+launch_suspend_request() {
+  local command=$1 lua_command
+  # Quattro's hyprctl dispatch accepts a Lua dispatcher expression. JSON
+  # quoting keeps the complete shell command inside one Lua string argument.
+  lua_command=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$command") || return 1
+  hyprctl dispatch "hl.dsp.exec_cmd($lua_command)" 9>&-
+}
+
+journal_cursor() {
+  journalctl -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p'
+}
+
+wait_for_suspend() {
+  local cursor=$1 i result
+  # Poll until the *new* suspend job completes. A successful systemctl suspend
+  # only means logind enqueued it; it does not report kernel freezer failures.
+  for i in {1..240}; do
+    current_token "$2" || return 2
+    # Inactive system units can be garbage-collected, losing Result and
+    # InvocationID. Journal job results survive that and the suspend cycle.
+    result=$(journalctl -u systemd-suspend.service --after-cursor="$cursor" -o json --no-pager | python3 -c '
+import json, sys
+result = "pending"
+for line in sys.stdin:
+    entry = json.loads(line)
+    if entry.get("UNIT") == "systemd-suspend.service" and "JOB_RESULT" in entry:
+        result = entry["JOB_RESULT"]
+print(result)
+') || return 3
+    [[ "$result" == 'done' ]] && return 0
+    if [[ "$result" != pending ]]; then
+      log err "systemd-suspend failed: $result"
+      return 1
+    fi
+    sleep 1
+  done
+  log err "timed out waiting for systemd-suspend completion"
+  # Do not enqueue another request when the outcome is unknown.
+  return 3
+}
+
 fire_timer() {
-  local restore
+  local token=${1:-$(state_value token 2>/dev/null)} restore attempt previous result rc
+  # Compatibility with pre-token transient timers already scheduled at upgrade.
+  if [[ -z "$token" && -f "$STATE_FILE" ]]; then
+    token="legacy-$(date +%s%N)-$$"
+    printf 'token=%s\n' "$token" >>"$STATE_FILE"
+  fi
+  current_token "$token" || return 0
   restore=$(state_value restore_idle 2>/dev/null || printf '0')
-  rm -f "$STATE_FILE"
   restore_idle "$restore"
   refresh_waybar
+  flock -u 9
 
-  log info "sleep timer fired; requesting suspend via Hyprland session"
-  if command -v hyprctl >/dev/null 2>&1; then
-    if hyprctl dispatch exec "$SUSPEND_CMD"; then
-      log info "suspend request dispatched through Hyprland"
-      return 0
+  for attempt in {1..3}; do
+    current_token "$token" || return 0
+    previous=$(journal_cursor) || break
+    [[ -n "$previous" ]] || break
+    result="$STATE_DIR/request.$token.$attempt"
+    log info "requesting suspend, attempt $attempt/3 ($token)"
+    if command -v hyprctl >/dev/null 2>&1; then
+      local command
+      printf -v command 'env %q %q %q request %q %q' \
+        "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}" \
+        "SLEEP_IN_SUSPEND_CMD=$SUSPEND_CMD" "$SELF" "$token" "$result"
+      # Do not pass the lifecycle lock to Hyprland's child.
+      if ! launch_suspend_request "$command"; then
+        request_suspend "$token" "$result"
+      fi
+    else
+      request_suspend "$token" "$result"
     fi
-    log warning "Hyprland dispatch failed; falling back to direct suspend request"
-  fi
+    local i
+    for ((i=0; i<15; i++)); do
+      current_token "$token" || return 0
+      [[ -f "$result" ]] && break
+      sleep 1
+    done
+    rc=3
+    if [[ -f "$result" ]]; then
+      if [[ "$(cat "$result")" == 0 ]]; then
+        if wait_for_suspend "$previous" "$token"; then rc=0; else rc=$?; fi
+      else
+        log err "suspend request rejected: $(cat "$result.log")"
+        rc=1
+      fi
+    else
+      log err "Hyprland suspend helper did not report an outcome"
+    fi
+    [[ "$rc" == 2 ]] && return 0
+    [[ "$rc" == 0 || "$rc" == 3 || "$attempt" == 3 ]] && break
+    log warning "retrying failed suspend in 30 seconds"
+    sleep 30
+  done
 
-  bash -lc "$SUSPEND_CMD"
+  acquire_lock
+  current_token "$token" || return 0
+  rm -f "$STATE_FILE"
+  if [[ "${rc:-1}" == 0 ]]; then
+    log info "suspend completed successfully ($token)"
+  else
+    local failure_tmp
+    failure_tmp=$(mktemp "$STATE_DIR/.failure.XXXXXX")
+    {
+      date --iso-8601=seconds
+      local request_log
+      for request_log in "$STATE_DIR"/request.*.log; do
+        [[ -f "$request_log" ]] && cat "$request_log"
+      done
+      for request_log in "$STATE_DIR"/request.*.inhibitors; do
+        [[ -f "$request_log" ]] && cat "$request_log"
+      done
+      journalctl -u systemd-suspend.service --since '-15 minutes' --no-pager
+      journalctl -k --since '-15 minutes' --no-pager -g 'PM:|Freezing|refusing|task:|fuse|Call Trace'
+    } >"$failure_tmp" 2>&1 || true
+    mv "$failure_tmp" "$STATE_DIR/failure"
+    log err "scheduled suspend failed; see $STATE_DIR/failure and the kernel journal"
+    notify "Sleep In: suspend failed" "The system could not suspend. Click to copy diagnostics.\nDetails: $STATE_DIR/failure" critical
+  fi
+  rm -f "$STATE_DIR"/request.*
+  refresh_waybar
+  [[ "${rc:-1}" == 0 ]]
+}
+
+copy_failure() {
+  if [[ ! -s "$STATE_DIR/failure" ]]; then
+    notify "Sleep In: nothing to copy" "No saved suspend failure diagnostics were found" critical
+    return 1
+  fi
+  # wl-copy's background clipboard owner must not hold the caller's output
+  # pipes open (notification handlers and captured CLI invocations can hang).
+  if ! env -u LD_LIBRARY_PATH -u LD_PRELOAD wl-copy --type text/plain \
+      <"$STATE_DIR/failure" >/dev/null 2>&1; then
+    notify "Sleep In: copy failed" "Could not copy suspend diagnostics to the clipboard" critical
+    return 1
+  fi
+  notify "Sleep In: diagnostics copied" "Suspend failure details are in your clipboard"
+}
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  exec 9>"$STATE_DIR/lock"
+  flock -x 9
 }
 
 show_status() {
@@ -202,6 +386,7 @@ prompt_and_schedule() {
   local input
   input=$(omarchy-menu-input "Sleep in (e.g. 90, 2h, 30m, 1h30)" --width 360) || return 0
   [[ -n "${input//[[:space:]]/}" ]] || return 0
+  acquire_lock
   schedule_timer "$input"
 }
 
@@ -212,16 +397,19 @@ Usage:
   sleep-in schedule DELAY  Schedule suspend (examples: 90, 30m, 2h, 1h30)
   sleep-in cancel          Cancel suspend and restore normal idle behavior
   sleep-in status          Print timer status
+  sleep-in copy-failure    Copy the most recent failure diagnostics to clipboard
 EOF
 }
 
 main() {
   case ${1:-prompt} in
     prompt) prompt_and_schedule ;;
-    schedule) [[ $# -eq 2 ]] || { usage >&2; return 2; }; schedule_timer "$2" ;;
-    cancel) cancel_timer ;;
+    schedule) [[ $# -eq 2 ]] || { usage >&2; return 2; }; acquire_lock; schedule_timer "$2" ;;
+    cancel) acquire_lock; cancel_timer ;;
     status) show_status ;;
-    fire) fire_timer ;;
+    copy-failure) copy_failure ;;
+    fire) acquire_lock; fire_timer "${2:-}" ;;
+    request) [[ $# -eq 3 ]] || return 2; request_suspend "$2" "$3" ;;
     -h|--help|help) usage ;;
     *) usage >&2; return 2 ;;
   esac

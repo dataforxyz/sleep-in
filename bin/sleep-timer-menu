@@ -2,6 +2,7 @@
 """Confirm cancellation of the current Sleep In timer from Waybar."""
 
 import datetime as dt
+import os
 import subprocess
 import sys
 import time
@@ -10,11 +11,14 @@ WAYBAR_SIGNAL = "RTMIN+11"
 
 
 def run(command, **kwargs):
-    return subprocess.run(command, stderr=subprocess.DEVNULL, text=True, **kwargs)
+    try:
+        return subprocess.run(command, stderr=subprocess.DEVNULL, text=True, **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(command, 127, stdout="")
 
 
 def sleep_in_status():
-    proc = run(["sleep-in", "status"], stdout=subprocess.PIPE)
+    proc = run(["sleep-in", "status"], stdout=subprocess.PIPE, timeout=5)
     fields = proc.stdout.strip().split("\t") if proc.returncode == 0 else []
     if len(fields) != 3 or fields[0] != "scheduled":
         return None
@@ -35,7 +39,9 @@ def duration(seconds):
 
 
 def notify(title, body=""):
-    run(["notify-send", "-u", "low", title, body])
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("LD_LIBRARY_PATH", "LD_PRELOAD")}
+    run(["notify-send", "-u", "low", title, body], env=env)
 
 
 def refresh_waybar():
@@ -54,18 +60,8 @@ def main():
     choice = f"Cancel suspend in {duration(remaining)} (at {when})"
     proc = run(
         [
-            "omarchy-launch-walker",
-            "--dmenu",
-            "--width",
-            "480",
-            "--minheight",
-            "1",
-            "--maxheight",
-            "180",
-            "-p",
-            "Sleep timer…",
+            "omarchy-menu-select", "Sleep timer…", choice,
         ],
-        input=choice + "\n",
         stdout=subprocess.PIPE,
     )
     if proc.returncode != 0 or proc.stdout.strip() != choice:
